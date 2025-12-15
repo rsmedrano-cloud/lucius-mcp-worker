@@ -65,15 +65,15 @@ async fn main() {
 }
 
 async fn command_listener(conn: &mut redis::aio::MultiplexedConnection) {
-    let queue_key = "mcp::tasks::all";
-    log(&format!("Listening for commands on '{}'", queue_key));
+    let queue_keys = ["mcp::tasks::shell", "mcp::tasks::docker"];
+    log(&format!("Listening for commands on queues: {:?}", queue_keys));
 
     loop {
         // 1. Safe Pop from the queue
-        let pop_result: redis::RedisResult<Option<String>> = conn.lpop(queue_key, None).await;
+        let pop_result: redis::RedisResult<(String, String)> = conn.blpop(&queue_keys, 0).await;
 
         match pop_result {
-            Ok(Some(json_str)) => {
+            Ok((_queue_name, json_str)) => {
                 log(&format!(">>> RECEIVED: {}", json_str));
 
                 // 2. Safe Parse the JSON into a Task
@@ -99,11 +99,6 @@ async fn command_listener(conn: &mut redis::aio::MultiplexedConnection) {
                     }
                 }
             }
-            Ok(None) => {
-                // This is the normal case when the queue is empty.
-                // Sleep for a short duration to prevent busy-looping.
-                time::sleep(Duration::from_secs(1)).await;
-            }
             Err(e) => {
                 log(&format!("[ERROR] Redis Error in Loop: {:?}", e));
                 // If a Redis error occurs, wait a bit before retrying.
@@ -122,9 +117,30 @@ async fn execute_task(task: &Task) -> Result<String, String> {
             Ok("Shell command executed successfully.".to_string())
         }
         TaskType::DOCKER => {
-            // Mock execution for now
-            log("TaskType was DOCKER. (Not implemented, mock success)");
-            Ok("Docker command executed successfully.".to_string())
+            let command = task.details["command"].as_str().unwrap_or("");
+            match command {
+                "list_containers" => {
+                    log("Executing docker ps -a --format '{{json .}}'");
+                    let output = tokio::process::Command::new("docker")
+                        .arg("ps")
+                        .arg("-a")
+                        .arg("--format")
+                        .arg("{{json .}}")
+                        .output()
+                        .await
+                        .map_err(|e| format!("Failed to execute docker command: {}", e))?;
+
+                    if output.status.success() {
+                        Ok(String::from_utf8_lossy(&output.stdout).to_string())
+                    } else {
+                        Err(format!(
+                            "Docker command failed: {}",
+                            String::from_utf8_lossy(&output.stderr)
+                        ))
+                    }
+                }
+                _ => Err(format!("Unsupported Docker command: {}", command)),
+            }
         }
     }
 }
